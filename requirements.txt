@@ -1,0 +1,5 @@
+apache-airflow==2.8.1
+pandas==2.1.4
+pyarrow==14.0.2
+python-dotenv==1.0.0
+boto3==1.34.14
