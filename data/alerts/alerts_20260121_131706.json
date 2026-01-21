@@ -1,0 +1,27 @@
+{
+  "alerts": [
+    {
+      "timestamp": "2026-01-21T13:17:06.626521",
+      "type": "LOW_STOCK",
+      "severity": "warning",
+      "branch_id": 1,
+      "product_id": 102,
+      "product_name": "Latte",
+      "stock_left": 3,
+      "threshold": 5,
+      "date": "2026-01-18"
+    },
+    {
+      "timestamp": "2026-01-21T13:17:06.627266",
+      "type": "LOW_STOCK",
+      "severity": "critical",
+      "branch_id": 2,
+      "product_id": 102,
+      "product_name": "Latte",
+      "stock_left": 2,
+      "threshold": 5,
+      "date": "2026-01-18"
+    }
+  ],
+  "count": 2
+}
