@@ -1,0 +1,22 @@
+# Branch locations in Barcelona
+branches:
+  1:
+    name: Gràcia
+    region: Barcelona
+  2:
+    name: Eixample
+    region: Barcelona
+  3:
+    name: El Born
+    region: Barcelona
+  4:
+    name: Beachfront
+    region: Barcelona
+  5:
+    name: Sarrià
+    region: Barcelona
+
+# Central warehouse
+warehouse:
+  name: Zona Franca HQ
+  region: Barcelona
