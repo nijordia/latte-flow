@@ -222,10 +222,10 @@ status              : pending | confirmed
 - **Docker Compose** — local deployment
 - **PyYAML** — config management
 
-**built with**
-Nic — the human brain
-Claude — the pretty boy
-Gork — drunk ghost who outs milk thieves
+**built with**  
+Nic — the human  
+Claude — the pretty boy  
+Gork —  the sarcastic ghost  
 
 ---
 
