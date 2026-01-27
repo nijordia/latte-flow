@@ -17,6 +17,6 @@ logs/
 data/bronze/*.csv
 data/silver/*.parquet
 data/gold/*.parquet
-alerts/*.json
+data/alerts/*.json
 .DS_Store
 Thumbs.db

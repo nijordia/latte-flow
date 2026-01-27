@@ -1,0 +1,26 @@
+# Product catalog with base pricing
+products:
+  101:
+    name: Espresso
+    base_price_eur: 2.50
+    category: coffee
+  102:
+    name: Latte
+    base_price_eur: 3.50
+    category: coffee
+  103:
+    name: Cappuccino
+    base_price_eur: 3.20
+    category: coffee
+  104:
+    name: Croissant
+    base_price_eur: 2.80
+    category: pastry
+  105:
+    name: Muffin
+    base_price_eur: 2.50
+    category: pastry
+  106:
+    name: Orange Juice
+    base_price_eur: 3.00
+    category: beverage

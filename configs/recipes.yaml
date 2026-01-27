@@ -1,0 +1,19 @@
+# Recipes: ingredients consumed per unit sold
+# Units: espresso in g, milk in ml, sugar in g, flour in g, butter in g, oranges in units
+recipes:
+  101:  # Espresso
+    espresso: 7
+  102:  # Latte
+    espresso: 7
+    milk: 180
+    sugar: 5
+  103:  # Cappuccino
+    espresso: 7
+    milk: 120
+  104:  # Croissant
+    flour: 200
+    butter: 30
+  105:  # Muffin - bought-in, no recipe
+    muffin_units: 1
+  106:  # Orange Juice
+    oranges: 1
