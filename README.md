@@ -222,6 +222,11 @@ status              : pending | confirmed
 - **Docker Compose** — local deployment
 - **PyYAML** — config management
 
+**built with**
+Nic — the human brain
+Claude — the pretty boy
+Gork — drunk ghost who outs milk thieves
+
 ---
 
 *Built for Barcelona coffee chains that don't trust their drivers.*
