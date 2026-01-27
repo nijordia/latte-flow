@@ -1,0 +1,62 @@
+# Central warehouse inventory (Zona Franca HQ)
+warehouse:
+  espresso:
+    name: Espresso Beans
+    unit: g
+    initial_stock: 10000   # 10kg
+    min_reorder: 500
+  milk:
+    name: Whole Milk
+    unit: ml
+    initial_stock: 200000  # 200L
+    min_reorder: 10000
+  sugar:
+    name: White Sugar
+    unit: g
+    initial_stock: 20000   # 20kg
+    min_reorder: 1000
+  flour:
+    name: All-Purpose Flour
+    unit: g
+    initial_stock: 50000   # 50kg
+    min_reorder: 2500
+  butter:
+    name: Unsalted Butter
+    unit: g
+    initial_stock: 20000   # 20kg
+    min_reorder: 1000
+  oranges:
+    name: Fresh Oranges
+    unit: units
+    initial_stock: 500
+    min_reorder: 25
+  muffin_units:
+    name: Muffins (pre-made)
+    unit: units
+    initial_stock: 200
+    min_reorder: 10
+
+# Branch inventory (each shop starts with 1/5 of warehouse)
+# min_reorder is per-branch threshold that triggers shipment request
+branch_defaults:
+  espresso:
+    initial_stock: 2000    # 2kg per branch
+    min_reorder: 100       # request shipment when below 100g
+  milk:
+    initial_stock: 40000   # 40L per branch
+    min_reorder: 2000      # request when below 2L
+  sugar:
+    initial_stock: 4000    # 4kg per branch
+    min_reorder: 200
+  flour:
+    initial_stock: 10000   # 10kg per branch
+    min_reorder: 500
+  butter:
+    initial_stock: 4000    # 4kg per branch
+    min_reorder: 200
+  oranges:
+    initial_stock: 100     # 100 per branch
+    min_reorder: 5
+  muffin_units:
+    initial_stock: 40      # 40 per branch
+    min_reorder: 5

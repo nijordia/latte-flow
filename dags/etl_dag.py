@@ -1,29 +1,39 @@
 import json
+import random
 from datetime import datetime, timedelta
 from pathlib import Path
+
 import pandas as pd
+import yaml
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
 
+# Paths
 DATA_DIR = Path("/opt/airflow/data")
-ALERTS_DIR = DATA_DIR / "alerts"
+CONFIG_DIR = Path("/opt/airflow/configs")
 BRONZE_DIR = DATA_DIR / "bronze"
 SILVER_DIR = DATA_DIR / "silver"
 GOLD_DIR = DATA_DIR / "gold"
+ALERTS_DIR = DATA_DIR / "alerts"
 
-# Stock safety threshold
-SAFETY_STOCK_THRESHOLD = 5
+# Alert state file for dedup
+ALERT_STATE_FILE = ALERTS_DIR / "alert_state.json"
 
-# Product category mapping
-PRODUCT_CATEGORIES = {
-    101: {"name": "Espresso", "category": "coffee"},
-    102: {"name": "Latte", "category": "coffee"},
-    103: {"name": "Cappuccino", "category": "coffee"},
-    104: {"name": "Croissant", "category": "pastry"},
-    105: {"name": "Muffin", "category": "pastry"},
-    106: {"name": "Orange Juice", "category": "beverage"},
-}
+# Initial product stock per branch (warn if sold > this)
+INITIAL_PRODUCT_STOCK = 100
+
+# Theft rate: drivers steal 5-10%
+THEFT_MIN = 0.05
+THEFT_MAX = 0.10
+
+
+def load_config(name: str) -> dict:
+    """Load a YAML config file."""
+    path = CONFIG_DIR / f"{name}.yaml"
+    with open(path) as f:
+        return yaml.safe_load(f)
+
 
 default_args = {
     "owner": "latte-flow",
@@ -36,7 +46,7 @@ default_args = {
 
 
 def alive():
-    print("latte-flow is alive")
+    print("latte-flow is alive - Barcelona edition")
     return "alive"
 
 
@@ -64,8 +74,9 @@ def bronze_to_parquet():
 
 
 def silver_clean():
-    """Clean, type cast, and enrich silver data with category info."""
-    # Only process raw parquets (exclude already cleaned ones)
+    """Clean, type cast, compute metrics, and enrich silver data."""
+    products_cfg = load_config("products")["products"]
+
     parquet_files = [
         f for f in SILVER_DIR.glob("*.parquet")
         if not f.name.startswith("cleaned_")
@@ -80,26 +91,26 @@ def silver_clean():
         print(f"Cleaning: {pq_path.name}")
         df = pd.read_parquet(pq_path)
 
-        # Type casting
         df["date"] = pd.to_datetime(df["date"])
         df["branch_id"] = df["branch_id"].astype("int32")
         df["product_id"] = df["product_id"].astype("int32")
-        df["sales_qty"] = df["sales_qty"].astype("int32")
-        df["stock_left"] = df["stock_left"].astype("int32")
-        df["price_eur"] = df["price_eur"].astype("float32")
+        df["qty"] = df["qty"].astype("int32")
+        df["total_paid"] = df["total_paid"].astype("float32")
 
-        # Enrich with product info
+        df["unit_price_paid"] = df["total_paid"] / df["qty"]
+        df["base_price"] = df["product_id"].map(
+            lambda x: products_cfg.get(x, {}).get("base_price_eur", 0.0)
+        ).astype("float32")
+        df["discount_rate"] = (1 - df["unit_price_paid"] / df["base_price"]).clip(0, 1)
+        df["revenue"] = df["total_paid"]
+
         df["product_name"] = df["product_id"].map(
-            lambda x: PRODUCT_CATEGORIES.get(x, {}).get("name", "Unknown")
+            lambda x: products_cfg.get(x, {}).get("name", "Unknown")
         )
         df["category"] = df["product_id"].map(
-            lambda x: PRODUCT_CATEGORIES.get(x, {}).get("category", "unknown")
+            lambda x: products_cfg.get(x, {}).get("category", "unknown")
         )
 
-        # Calculate revenue
-        df["revenue_eur"] = df["sales_qty"] * df["price_eur"]
-
-        # Write to cleaned_ prefix (preserves raw parquet)
         cleaned_path = SILVER_DIR / f"cleaned_{pq_path.name}"
         df.to_parquet(cleaned_path, index=False)
         print(f"Written: {cleaned_path}")
@@ -109,42 +120,31 @@ def silver_clean():
 
 
 def gold_fact_sales():
-    """Build fact_sales table from cleaned silver data."""
+    """Build fact_sales table with cumulative stock tracking."""
     cleaned_files = list(SILVER_DIR.glob("cleaned_*.parquet"))
 
     if not cleaned_files:
         print("No cleaned parquet files found in silver/")
         return None
 
-    # Combine all cleaned files
     dfs = [pd.read_parquet(f) for f in cleaned_files]
     df = pd.concat(dfs, ignore_index=True)
 
-    # fact_sales: transactional grain
+    df = df.sort_values(["branch_id", "product_id", "date"]).reset_index(drop=True)
+    df["cumulative_qty"] = df.groupby(["branch_id", "product_id"])["qty"].cumsum()
+    df["stock_left"] = INITIAL_PRODUCT_STOCK - df["cumulative_qty"]
+
+    oversold = df[df["stock_left"] < 0]
+    if not oversold.empty:
+        for _, row in oversold.drop_duplicates(["branch_id", "product_id"]).iterrows():
+            print(f"WARNING: Branch {row['branch_id']} sold more than {INITIAL_PRODUCT_STOCK} "
+                  f"of product {row['product_id']} ({row['product_name']})")
+
     fact_sales = df[[
-        "date",
-        "branch_id",
-        "product_id",
-        "sales_qty",
-        "stock_left",
-        "price_eur",
-        "revenue_eur",
+        "date", "branch_id", "product_id", "qty", "total_paid",
+        "unit_price_paid", "base_price", "discount_rate", "revenue", "stock_left",
     ]].copy()
-
-    # Add surrogate key
-    fact_sales["sale_id"] = range(1, len(fact_sales) + 1)
-
-    # Reorder columns
-    fact_sales = fact_sales[[
-        "sale_id",
-        "date",
-        "branch_id",
-        "product_id",
-        "sales_qty",
-        "stock_left",
-        "price_eur",
-        "revenue_eur",
-    ]]
+    fact_sales.insert(0, "sale_id", range(1, len(fact_sales) + 1))
 
     output_path = GOLD_DIR / "fact_sales.parquet"
     fact_sales.to_parquet(output_path, index=False)
@@ -154,17 +154,21 @@ def gold_fact_sales():
 
 
 def gold_dim_product():
-    """Build dim_product table from product categories."""
+    """Build dim_product table from config."""
+    products_cfg = load_config("products")["products"]
+
     dim_product = pd.DataFrame([
         {
-            "product_id": pid,
+            "product_id": int(pid),
             "product_name": info["name"],
+            "base_price": info["base_price_eur"],
             "category": info["category"],
         }
-        for pid, info in PRODUCT_CATEGORIES.items()
+        for pid, info in products_cfg.items()
     ])
 
     dim_product["product_id"] = dim_product["product_id"].astype("int32")
+    dim_product["base_price"] = dim_product["base_price"].astype("float32")
 
     output_path = GOLD_DIR / "dim_product.parquet"
     dim_product.to_parquet(output_path, index=False)
@@ -173,56 +177,372 @@ def gold_dim_product():
     return str(output_path)
 
 
-def check_stock_alerts():
-    """Check for low stock and generate alerts."""
-    fact_sales_path = GOLD_DIR / "fact_sales.parquet"
+def gold_dim_branch():
+    """Build dim_branch table from config."""
+    branches_cfg = load_config("branches")["branches"]
 
+    dim_branch = pd.DataFrame([
+        {
+            "branch_id": int(bid),
+            "location_name": info["name"],
+            "region": info["region"],
+        }
+        for bid, info in branches_cfg.items()
+    ])
+
+    dim_branch["branch_id"] = dim_branch["branch_id"].astype("int32")
+
+    output_path = GOLD_DIR / "dim_branch.parquet"
+    dim_branch.to_parquet(output_path, index=False)
+    print(f"Written: {output_path} ({len(dim_branch)} rows)")
+
+    return str(output_path)
+
+
+def process_inventory_and_shipments():
+    """
+    Process inventory with warehouse/branch model and shipments.
+
+    Flow:
+    1. Initialize warehouse and branch inventories
+    2. Process each day chronologically:
+       a. Confirm pending shipments from previous day (with theft)
+       b. Deduct today's sales from branch inventory
+       c. Check branch stock levels
+       d. If low → check warehouse → create shipment (2x min_reorder)
+       e. If warehouse empty → alert
+    3. Save all outputs
+    """
+    recipes_cfg = load_config("recipes")["recipes"]
+    inventory_cfg = load_config("inventory")
+    branches_cfg = load_config("branches")["branches"]
+
+    warehouse_cfg = inventory_cfg["warehouse"]
+    branch_defaults = inventory_cfg["branch_defaults"]
+
+    branch_ids = [int(bid) for bid in branches_cfg.keys()]
+    ingredient_ids = list(warehouse_cfg.keys())
+
+    # Initialize warehouse stock
+    warehouse = {
+        ing_id: {
+            "name": info["name"],
+            "unit": info["unit"],
+            "initial_stock": info["initial_stock"],
+            "current_stock": info["initial_stock"],
+            "min_reorder": info["min_reorder"],
+        }
+        for ing_id, info in warehouse_cfg.items()
+    }
+
+    # Initialize branch stock (each branch starts with branch_defaults)
+    branch_inventory = {}
+    for branch_id in branch_ids:
+        branch_inventory[branch_id] = {}
+        for ing_id in ingredient_ids:
+            branch_inventory[branch_id][ing_id] = {
+                "initial_stock": branch_defaults[ing_id]["initial_stock"],
+                "current_stock": branch_defaults[ing_id]["initial_stock"],
+                "min_reorder": branch_defaults[ing_id]["min_reorder"],
+            }
+
+    # Load fact_sales to get daily consumption
+    fact_sales_path = GOLD_DIR / "fact_sales.parquet"
     if not fact_sales_path.exists():
-        print("fact_sales.parquet not found, skipping alerts")
+        print("fact_sales.parquet not found, using initial stock only")
+        sales_df = pd.DataFrame()
+    else:
+        sales_df = pd.read_parquet(fact_sales_path)
+
+    # Compute ingredient consumption per sale
+    def get_ingredient_usage(product_id, qty):
+        recipe = recipes_cfg.get(product_id, {})
+        return {ing: amount * qty for ing, amount in recipe.items()}
+
+    # Group sales by date and branch
+    shipments = []
+    alerts = []
+    shipment_id = 0
+
+    if not sales_df.empty:
+        # Get unique dates sorted
+        dates = sorted(sales_df["date"].unique())
+
+        # Track pending shipments (sent yesterday, arrives today)
+        pending_shipments = []
+
+        for current_date in dates:
+            date_str = pd.Timestamp(current_date).strftime("%Y-%m-%d")
+            print(f"\n=== Processing {date_str} ===")
+
+            # 1. Confirm pending shipments from previous day (with theft)
+            for pending in pending_shipments:
+                theft_rate = random.uniform(THEFT_MIN, THEFT_MAX)
+                confirmed_qty = pending["sent_qty"] * (1 - theft_rate)
+
+                # Add to branch inventory
+                branch_id = pending["branch_id"]
+                ing_id = pending["ingredient_id"]
+                branch_inventory[branch_id][ing_id]["current_stock"] += confirmed_qty
+
+                # Update shipment record
+                pending["received_qty"] = pending["sent_qty"]  # What should have arrived
+                pending["confirmed_qty"] = round(confirmed_qty, 2)  # What actually arrived
+                pending["shipment_received_at"] = date_str
+                pending["status"] = "confirmed"
+
+                stolen = pending["sent_qty"] - confirmed_qty
+                print(f"  SHIPMENT CONFIRMED: {ing_id} to branch {branch_id}: "
+                      f"sent={pending['sent_qty']:.0f}, received={confirmed_qty:.0f} "
+                      f"(stolen={stolen:.0f}, {theft_rate*100:.1f}%)")
+
+            pending_shipments = []
+
+            # 2. Deduct today's sales from branch inventory
+            today_sales = sales_df[sales_df["date"] == current_date]
+
+            for _, sale in today_sales.iterrows():
+                branch_id = int(sale["branch_id"])
+                product_id = int(sale["product_id"])
+                qty = int(sale["qty"])
+
+                usage = get_ingredient_usage(product_id, qty)
+                for ing_id, amount in usage.items():
+                    if ing_id in branch_inventory[branch_id]:
+                        old_stock = branch_inventory[branch_id][ing_id]["current_stock"]
+                        new_stock = old_stock - amount
+
+                        if new_stock < 0:
+                            # Cap at zero and log warning
+                            branch_inventory[branch_id][ing_id]["current_stock"] = 0
+                            print(f"  OVERSOLD WARNING: Branch {branch_id} sold {qty} of product "
+                                  f"{product_id} but only had {old_stock:.1f} {warehouse[ing_id]['unit']} "
+                                  f"of {ing_id} left. Stock capped at 0.")
+
+                            # Create oversold alert
+                            alerts.append({
+                                "timestamp": date_str,
+                                "type": "OVERSOLD_BRANCH",
+                                "severity": "warning",
+                                "branch_id": branch_id,
+                                "ingredient_id": ing_id,
+                                "ingredient_name": warehouse[ing_id]["name"],
+                                "unit": warehouse[ing_id]["unit"],
+                                "old_stock": round(old_stock, 2),
+                                "attempted_deduction": amount,
+                                "product_id": product_id,
+                                "qty_sold": qty,
+                                "date": date_str,
+                            })
+                        else:
+                            branch_inventory[branch_id][ing_id]["current_stock"] = new_stock
+
+            # 3. Check branch stock levels and create shipments
+            for branch_id in branch_ids:
+                for ing_id in ingredient_ids:
+                    branch_stock = branch_inventory[branch_id][ing_id]
+                    current = branch_stock["current_stock"]
+                    min_reorder = branch_stock["min_reorder"]
+
+                    if current < min_reorder:
+                        # Need to restock - request 2x min_reorder
+                        request_qty = min_reorder * 2
+
+                        # Check warehouse
+                        if warehouse[ing_id]["current_stock"] >= request_qty:
+                            # Create shipment
+                            shipment_id += 1
+                            warehouse[ing_id]["current_stock"] -= request_qty
+
+                            shipment = {
+                                "shipment_id": shipment_id,
+                                "date_sent": date_str,
+                                "branch_id": branch_id,
+                                "ingredient_id": ing_id,
+                                "sent_qty": request_qty,
+                                "received_qty": None,
+                                "confirmed_qty": None,
+                                "shipment_received_at": None,
+                                "status": "pending",
+                            }
+                            shipments.append(shipment)
+                            pending_shipments.append(shipment)
+
+                            print(f"  SHIPMENT SENT: {ing_id} to branch {branch_id}: "
+                                  f"qty={request_qty:.0f} (branch had {current:.0f}, min={min_reorder:.0f})")
+                        else:
+                            # Warehouse empty - alert!
+                            alert = {
+                                "timestamp": date_str,
+                                "type": "WAREHOUSE_EMPTY",
+                                "severity": "critical",
+                                "ingredient_id": ing_id,
+                                "ingredient_name": warehouse[ing_id]["name"],
+                                "warehouse_stock": warehouse[ing_id]["current_stock"],
+                                "requested_qty": request_qty,
+                                "branch_id": branch_id,
+                            }
+                            alerts.append(alert)
+                            print(f"  ALERT: Warehouse empty for {ing_id}! "
+                                  f"Branch {branch_id} needs {request_qty:.0f}, "
+                                  f"warehouse has {warehouse[ing_id]['current_stock']:.0f}")
+
+        # Confirm any remaining pending shipments (simulate next day)
+        final_date = pd.Timestamp(dates[-1]) + timedelta(days=1)
+        final_date_str = final_date.strftime("%Y-%m-%d")
+        for pending in pending_shipments:
+            theft_rate = random.uniform(THEFT_MIN, THEFT_MAX)
+            confirmed_qty = pending["sent_qty"] * (1 - theft_rate)
+
+            branch_id = pending["branch_id"]
+            ing_id = pending["ingredient_id"]
+            branch_inventory[branch_id][ing_id]["current_stock"] += confirmed_qty
+
+            pending["received_qty"] = pending["sent_qty"]
+            pending["confirmed_qty"] = round(confirmed_qty, 2)
+            pending["shipment_received_at"] = final_date_str
+            pending["status"] = "confirmed"
+
+    # Save warehouse inventory
+    now = datetime.now().isoformat()
+    warehouse_rows = []
+    for ing_id, info in warehouse.items():
+        warehouse_rows.append({
+            "ingredient_id": ing_id,
+            "ingredient_name": info["name"],
+            "unit": info["unit"],
+            "initial_stock": info["initial_stock"],
+            "current_stock": info["current_stock"],
+            "min_reorder": info["min_reorder"],
+            "last_updated": now,
+        })
+
+    warehouse_df = pd.DataFrame(warehouse_rows)
+    warehouse_path = GOLD_DIR / "dim_warehouse.parquet"
+    warehouse_df.to_parquet(warehouse_path, index=False)
+    print(f"\nWritten: {warehouse_path} ({len(warehouse_df)} rows)")
+
+    # Print warehouse status
+    print("\nWarehouse status:")
+    for _, row in warehouse_df.iterrows():
+        pct = row["current_stock"] / row["initial_stock"] * 100
+        status = "LOW" if row["current_stock"] < row["min_reorder"] else "OK"
+        print(f"  {row['ingredient_name']}: {row['current_stock']:.0f} {row['unit']} "
+              f"({pct:.0f}% remaining) [{status}]")
+
+    # Save branch inventory
+    branch_rows = []
+    for branch_id in branch_ids:
+        for ing_id in ingredient_ids:
+            info = branch_inventory[branch_id][ing_id]
+            branch_rows.append({
+                "branch_id": branch_id,
+                "ingredient_id": ing_id,
+                "initial_stock": info["initial_stock"],
+                "current_stock": round(info["current_stock"], 2),
+                "min_reorder": info["min_reorder"],
+                "last_updated": now,
+            })
+
+    branch_inv_df = pd.DataFrame(branch_rows)
+    branch_inv_df["branch_id"] = branch_inv_df["branch_id"].astype("int32")
+    branch_inv_path = GOLD_DIR / "branch_inventory.parquet"
+    branch_inv_df.to_parquet(branch_inv_path, index=False)
+    print(f"Written: {branch_inv_path} ({len(branch_inv_df)} rows)")
+
+    # Save shipments
+    if shipments:
+        shipment_df = pd.DataFrame(shipments)
+        shipment_df["branch_id"] = shipment_df["branch_id"].astype("int32")
+        shipment_path = GOLD_DIR / "shipment.parquet"
+        shipment_df.to_parquet(shipment_path, index=False)
+        print(f"Written: {shipment_path} ({len(shipment_df)} rows)")
+
+        # Shipment stats
+        total_sent = shipment_df["sent_qty"].sum()
+        total_confirmed = shipment_df["confirmed_qty"].sum()
+        total_stolen = total_sent - total_confirmed
+        print(f"\nShipment summary: sent={total_sent:.0f}, received={total_confirmed:.0f}, "
+              f"stolen={total_stolen:.0f} ({total_stolen/total_sent*100:.1f}%)")
+    else:
+        print("No shipments created")
+
+    # Save alerts
+    if alerts:
+        ALERTS_DIR.mkdir(parents=True, exist_ok=True)
+        alert_file = ALERTS_DIR / f"alerts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(alert_file, "w") as f:
+            json.dump({"alerts": alerts, "count": len(alerts)}, f, indent=2)
+        print(f"Written: {alert_file} ({len(alerts)} alerts)")
+
+    return {
+        "warehouse": str(warehouse_path),
+        "branch_inventory": str(branch_inv_path),
+        "shipments": len(shipments),
+        "alerts": len(alerts),
+    }
+
+
+def check_warehouse_alerts():
+    """Check for low warehouse stock and generate alerts (with 48h dedup)."""
+    warehouse_path = GOLD_DIR / "dim_warehouse.parquet"
+
+    if not warehouse_path.exists():
+        print("dim_warehouse.parquet not found, skipping alerts")
         return []
 
-    df = pd.read_parquet(fact_sales_path)
+    df = pd.read_parquet(warehouse_path)
+    now = datetime.now()
 
-    # Find low stock items
-    low_stock = df[df["stock_left"] < SAFETY_STOCK_THRESHOLD].copy()
+    ALERTS_DIR.mkdir(parents=True, exist_ok=True)
+    if ALERT_STATE_FILE.exists():
+        with open(ALERT_STATE_FILE) as f:
+            alert_state = json.load(f)
+    else:
+        alert_state = {}
+
+    low_stock = df[df["current_stock"] < df["min_reorder"]]
 
     if low_stock.empty:
-        print("No low stock alerts")
+        print("No low warehouse stock alerts")
         return []
 
-    # Enrich with product names
-    low_stock["product_name"] = low_stock["product_id"].map(
-        lambda x: PRODUCT_CATEGORIES.get(x, {}).get("name", "Unknown")
-    )
-
-    # Build alerts
     alerts = []
     for _, row in low_stock.iterrows():
+        ingredient_id = row["ingredient_id"]
+
+        last_alerted = alert_state.get(f"warehouse_{ingredient_id}")
+        if last_alerted:
+            last_alerted_dt = datetime.fromisoformat(last_alerted)
+            if now - last_alerted_dt < timedelta(hours=48):
+                print(f"Skipping alert for {row['ingredient_name']} "
+                      f"(alerted {(now - last_alerted_dt).total_seconds() / 3600:.1f}h ago)")
+                continue
+
         alert = {
-            "timestamp": datetime.now().isoformat(),
-            "type": "LOW_STOCK",
-            "severity": "critical" if row["stock_left"] <= 2 else "warning",
-            "branch_id": int(row["branch_id"]),
-            "product_id": int(row["product_id"]),
-            "product_name": row["product_name"],
-            "stock_left": int(row["stock_left"]),
-            "threshold": SAFETY_STOCK_THRESHOLD,
-            "date": row["date"].strftime("%Y-%m-%d"),
+            "timestamp": now.isoformat(),
+            "type": "LOW_WAREHOUSE_STOCK",
+            "severity": "critical" if row["current_stock"] <= 0 else "warning",
+            "ingredient_id": ingredient_id,
+            "ingredient_name": row["ingredient_name"],
+            "current_stock": float(row["current_stock"]),
+            "min_reorder": float(row["min_reorder"]),
+            "unit": row["unit"],
         }
         alerts.append(alert)
-        print(f"ALERT: {alert['product_name']} at branch {alert['branch_id']} "
-              f"has {alert['stock_left']} units left ({alert['severity']})")
+        alert_state[f"warehouse_{ingredient_id}"] = now.isoformat()
 
-    # Write alerts to JSON
-    ALERTS_DIR.mkdir(parents=True, exist_ok=True)
-    alert_file = ALERTS_DIR / f"alerts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    with open(alert_file, "w") as f:
-        json.dump({"alerts": alerts, "count": len(alerts)}, f, indent=2)
+        print(f"ALERT: Warehouse {alert['ingredient_name']} at {alert['current_stock']:.0f} "
+              f"{alert['unit']} (min: {alert['min_reorder']:.0f}) [{alert['severity']}]")
 
-    print(f"Written: {alert_file} ({len(alerts)} alerts)")
+    with open(ALERT_STATE_FILE, "w") as f:
+        json.dump(alert_state, f, indent=2)
 
-    # TODO: SNS hook for cloud deployment
-    # boto3.client('sns', endpoint_url='http://localstack:4566').publish(...)
+    if alerts:
+        alert_file = ALERTS_DIR / f"warehouse_alerts_{now.strftime('%Y%m%d_%H%M%S')}.json"
+        with open(alert_file, "w") as f:
+            json.dump({"alerts": alerts, "count": len(alerts)}, f, indent=2)
+        print(f"Written: {alert_file} ({len(alerts)} alerts)")
 
     return alerts
 
@@ -230,11 +550,11 @@ def check_stock_alerts():
 with DAG(
     dag_id="latte_flow_etl",
     default_args=default_args,
-    description="ETL pipeline for coffee chain POS data",
+    description="ETL pipeline for Barcelona coffee chain",
     schedule="@daily",
     start_date=datetime(2026, 1, 1),
     catchup=False,
-    tags=["latte-flow", "etl"],
+    tags=["latte-flow", "etl", "barcelona"],
 ) as dag:
 
     alive_task = PythonOperator(
@@ -257,15 +577,27 @@ with DAG(
         python_callable=gold_fact_sales,
     )
 
-    gold_dim_task = PythonOperator(
+    gold_dim_product_task = PythonOperator(
         task_id="gold_dim_product",
         python_callable=gold_dim_product,
     )
 
-    alert_task = PythonOperator(
-        task_id="check_stock_alerts",
-        python_callable=check_stock_alerts,
+    gold_dim_branch_task = PythonOperator(
+        task_id="gold_dim_branch",
+        python_callable=gold_dim_branch,
     )
 
-    alive_task >> bronze_task >> silver_task >> [gold_fact_task, gold_dim_task]
-    gold_fact_task >> alert_task
+    inventory_task = PythonOperator(
+        task_id="process_inventory_and_shipments",
+        python_callable=process_inventory_and_shipments,
+    )
+
+    alert_task = PythonOperator(
+        task_id="check_warehouse_alerts",
+        python_callable=check_warehouse_alerts,
+    )
+
+    # DAG structure
+    alive_task >> bronze_task >> silver_task >> gold_fact_task
+    gold_fact_task >> [gold_dim_product_task, gold_dim_branch_task, inventory_task]
+    inventory_task >> alert_task
