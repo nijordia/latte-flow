@@ -83,6 +83,18 @@ services:
     volumes:
       - localstack_data:/var/lib/localstack
 
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./grafana:/var/lib/grafana
+    depends_on:
+      - postgres
+
 volumes:
   postgres_data:
   localstack_data:

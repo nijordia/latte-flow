@@ -1,4 +1,5 @@
 import json
+import os
 import random
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -7,6 +8,7 @@ import pandas as pd
 import yaml
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from sqlalchemy import create_engine
 
 
 # Paths
@@ -585,6 +587,55 @@ def check_warehouse_alerts():
     return alerts
 
 
+def load_gold_to_postgres():
+    """Load all gold parquet files into PostgreSQL for Grafana dashboards."""
+    # Use same postgres as Airflow (from docker-compose)
+    pg_conn = os.environ.get(
+        "POSTGRES_CONN",
+        "postgresql://airflow:airflow@postgres:5432/airflow"
+    )
+    engine = create_engine(pg_conn)
+
+    # Gold parquet files to load
+    gold_files = [
+        "fact_sales",
+        "dim_product",
+        "dim_branch",
+        "dim_warehouse",
+        "branch_inventory",
+        "shipment",
+    ]
+
+    loaded = []
+    for table_name in gold_files:
+        parquet_path = GOLD_DIR / f"{table_name}.parquet"
+        if not parquet_path.exists():
+            print(f"Skipping {table_name}: file not found")
+            continue
+
+        df = pd.read_parquet(parquet_path)
+
+        # Handle date columns (convert to proper datetime)
+        for col in df.columns:
+            if "date" in col.lower():
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+
+        # Load to postgres (replace if exists)
+        df.to_sql(
+            table_name,
+            engine,
+            schema="public",
+            if_exists="replace",
+            index=False,
+        )
+        print(f"Loaded {table_name}: {len(df)} rows")
+        loaded.append(table_name)
+
+    engine.dispose()
+    print(f"\nLoaded {len(loaded)} tables to PostgreSQL")
+    return loaded
+
+
 with DAG(
     dag_id="latte_flow_etl",
     default_args=default_args,
@@ -635,7 +686,13 @@ with DAG(
         python_callable=check_warehouse_alerts,
     )
 
+    load_postgres_task = PythonOperator(
+        task_id="load_gold_to_postgres",
+        python_callable=load_gold_to_postgres,
+    )
+
     # DAG structure
     alive_task >> bronze_task >> silver_task >> gold_fact_task
     gold_fact_task >> [gold_dim_product_task, gold_dim_branch_task, inventory_task]
     inventory_task >> alert_task
+    inventory_task >> load_postgres_task
