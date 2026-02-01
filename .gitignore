@@ -20,5 +20,5 @@ data/gold/*.parquet
 data/alerts/*.json
 .DS_Store
 Thumbs.db
-grafana/
+
 .claude/

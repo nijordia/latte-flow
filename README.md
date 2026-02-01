@@ -292,8 +292,8 @@ SELECT
   ingredient_id,
   sent_qty,
   confirmed_qty,
-  sent_qty - confirmed_qty as stolen,
-  ROUND((sent_qty - confirmed_qty) / sent_qty * 100, 1) as theft_pct
+  sent_qty - confirmed_qty AS stolen,
+  ROUND(CAST((sent_qty - confirmed_qty) / sent_qty * 100 AS numeric), 1) AS theft_pct
 FROM shipment
 WHERE status = 'confirmed'
 ORDER BY theft_pct DESC;
