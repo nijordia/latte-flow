@@ -27,23 +27,22 @@ def load_config(name: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
 
-
 def generate_fake_data(
     num_rows: int = 500,
     num_days: int = 30,
     start_date: datetime = None,
     chaos_mode: bool = False,
 ):
-    """Generate fake POS sales data."""
+    """Generate fake POS sales with full discount logic and branch/product weights."""
     if start_date is None:
         start_date = datetime(2026, 1, 1)
 
     products_cfg = load_config("products")["products"]
 
-    # Product weights (coffee dominant)
+    # Product weights (as you defined)
     product_weights = {
         101: 25,   # Espresso
-        102: 30,   # Latte ← most popular
+        102: 30,   # Latte
         103: 20,   # Cappuccino
         104: 12,   # Croissant
         105: 8,    # Muffin
@@ -51,70 +50,64 @@ def generate_fake_data(
     }
     product_ids = list(product_weights.keys())
     weights = list(product_weights.values())
-
-    branch_ids = [1, 2, 3, 4, 5]  # Barcelona branches
+    branch_ids = [1, 2, 3, 4, 5]
 
     rows = []
 
-    if chaos_mode:
-        # Chaos mode: massive latte oversell on one day (Jan 15) in Branch 2 (Eixample)
-        chaos_date = start_date + timedelta(days=14)  # Jan 15, 2026
-        date_str = chaos_date.strftime("%Y-%m-%d")
-        branch_id = 2  # Eixample - let's break its milk fridge
+    # Normal sales loop (most of the data)
+    for _ in range(num_rows):
+        # 1. Date & Branch Selection
+        day_offset = random.randint(0, num_days - 1)
+        date = start_date + timedelta(days=day_offset)
+        date_str = date.strftime("%Y-%m-%d")
+        branch_id = random.choice(branch_ids)
 
-        print(f"CHAOS MODE ACTIVATED: {num_rows} lattes on {date_str} at Branch {branch_id}")
+        # 2. Product Selection
+        product_id = random.choices(product_ids, weights=weights)[0]
+        base_price = products_cfg[product_id]["base_price_eur"]
+        unit_price = base_price
 
-        for _ in range(num_rows):
-            product_id = 102  # Force latte
-            qty = random.choices([1, 2, 3, 4, 5, 6, 8, 10], weights=[5, 10, 15, 20, 20, 15, 10, 5])[0]
+        # 3. APPLY YOUR DISCOUNT DYNAMICS
+        # Tuesday croissant 30% off
+        if date.weekday() == 1 and product_id == 104:
+            unit_price = base_price * 0.70
+        # Occasional small random discount (5-15%)
+        elif random.random() < 0.1:
+            discount = random.uniform(0.05, 0.15)
+            unit_price = base_price * (1 - discount)
 
-            base_price = products_cfg[product_id]["base_price_eur"]
-            unit_price = base_price  # no discount in chaos
+        # 4. Quantity Selection (Normal vs Peak/Chaos)
+        if chaos_mode:
+            qty = random.randint(50, 100)  # go insane
+        else:
+            qty = random.choices(
+                [1, 3, 5, 7, 10],
+                weights=[60, 20, 10, 7, 3]
+            )[0]  # slightly heavier, but not chaos
 
-            total_paid = round(unit_price * qty, 2)
+        total_paid = round(unit_price * qty, 2)
 
+        rows.append({
+            "date": date_str,
+            "branch_id": branch_id,
+            "product_id": product_id,
+            "qty": qty,
+            "total_paid": total_paid,
+        })
+
+    # INJECT OVERSOLD DAYS — this happens AFTER the normal loop
+    # These are extra rows that force massive latte sales on specific days
+    oversell_days = [3, 10, 17, 24]  # e.g. Jan 4, 11, 18, 25
+    for day_offset in oversell_days:
+        date = start_date + timedelta(days=day_offset)
+        date_str = date.strftime("%Y-%m-%d")
+        for i in range(80):  # 80 big latte sales per oversell day = ~1600 units total per day
             rows.append({
                 "date": date_str,
-                "branch_id": branch_id,
-                "product_id": product_id,
-                "qty": qty,
-                "total_paid": total_paid,
-            })
-
-    else:
-        # Normal realistic mode
-        for _ in range(num_rows):
-            day_offset = random.randint(0, num_days - 1)
-            date = start_date + timedelta(days=day_offset)
-            date_str = date.strftime("%Y-%m-%d")
-
-            branch_id = random.choice(branch_ids)
-
-            product_id = random.choices(product_ids, weights=weights)[0]
-            product_info = products_cfg[product_id]
-            base_price = product_info["base_price_eur"]
-
-            qty = random.choices([1, 2, 3, 4, 5], weights=[50, 25, 15, 7, 3])[0]
-
-            unit_price = base_price
-
-            # Tuesday croissant 30% off
-            if date.weekday() == 1 and product_id == 104:  # Tuesday
-                unit_price = base_price * 0.70
-
-            # Occasional small random discount (5-15%)
-            elif random.random() < 0.1:
-                discount = random.uniform(0.05, 0.15)
-                unit_price = base_price * (1 - discount)
-
-            total_paid = round(unit_price * qty, 2)
-
-            rows.append({
-                "date": date_str,
-                "branch_id": branch_id,
-                "product_id": product_id,
-                "qty": qty,
-                "total_paid": total_paid,
+                "branch_id": random.choice(branch_ids),
+                "product_id": 102,  # latte = milk assassin
+                "qty": 20,
+                "total_paid": round(products_cfg[102]["base_price_eur"] * 20 * 0.95, 2),  # slight random discount
             })
 
     return rows

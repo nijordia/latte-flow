@@ -28,15 +28,15 @@ Centralizes POS exports from 5 Barcelona coffee shops, tracks ingredient invento
 # generate fake data (30 days, 500 rows, 5 branches)
 python scripts/generate_fake.py
 
-# spin up airflow + postgres + localstack
+# spin up airflow + postgres + localstack + grafana
 docker-compose up -d
 
 # wait ~30s, then open
-open http://localhost:8080
-# login: admin / admin
+open http://localhost:8080   # Airflow (admin / admin)
+open http://localhost:3000   # Grafana (admin / admin)
 ```
 
-Trigger the DAG, watch shipments flow.
+Trigger the DAG, watch shipments flow. Gold tables load to PostgreSQL for Grafana.
 
 ## Inventory model
 
@@ -100,8 +100,10 @@ gold_fact_sales
   ▼                    ▼                    ▼
 gold_dim_product    gold_dim_branch    process_inventory_and_shipments
                                            │
-                                           ▼
-                                    check_warehouse_alerts
+                                     ┌─────┴─────┐
+                                     ▼           ▼
+                          check_warehouse    load_gold_to
+                              _alerts          _postgres
 ```
 
 ## Project structure
@@ -122,6 +124,7 @@ latte-flow/
 │   ├── silver/                 # parquet
 │   ├── gold/                   # fact + dim tables + shipments
 │   └── alerts/                 # JSON alerts
+├── grafana/                    # Grafana data (auto-created)
 ├── docker-compose.yml
 ├── requirements.txt
 └── .env
@@ -223,6 +226,79 @@ Alerts are aggregated per branch per day. Each `BRANCH_RESTOCK_NEEDED` alert lis
 - `OVERSOLD` — Branch sold more than available stock
 - `WAREHOUSE_EMPTY` — Warehouse couldn't fulfill the restock request
 
+## Grafana dashboards
+
+Gold tables are loaded to PostgreSQL after each DAG run. Connect Grafana to query them.
+
+### Setup datasource
+
+1. Open Grafana: http://localhost:3000 (admin / admin)
+2. Go to **Connections** → **Data sources** → **Add data source**
+3. Select **PostgreSQL**
+4. Configure:
+   - Host: `postgres:5432`
+   - Database: `airflow`
+   - User: `airflow`
+   - Password: `airflow`
+   - TLS/SSL Mode: `disable`
+5. Click **Save & test**
+
+### Tables available
+
+| Table | Description |
+|-------|-------------|
+| `fact_sales` | All sales transactions |
+| `dim_product` | Product catalog |
+| `dim_branch` | Branch locations |
+| `dim_warehouse` | Warehouse stock levels |
+| `branch_inventory` | Per-branch ingredient stock |
+| `shipment` | Shipments with theft tracking |
+
+### Example queries
+
+**Sales by branch and product:**
+```sql
+SELECT
+  fs.date,
+  db.location_name,
+  dp.product_name,
+  SUM(fs.qty) as total_qty,
+  SUM(fs.revenue) as total_revenue
+FROM fact_sales fs
+JOIN dim_branch db ON fs.branch_id = db.branch_id
+JOIN dim_product dp ON fs.product_id = dp.product_id
+GROUP BY fs.date, db.location_name, dp.product_name
+ORDER BY fs.date, total_revenue DESC;
+```
+
+**Latte sales by branch:**
+```sql
+SELECT
+  fs.date,
+  db.location_name,
+  dp.product_name,
+  fs.qty
+FROM fact_sales fs
+JOIN dim_branch db ON fs.branch_id = db.branch_id
+JOIN dim_product dp ON fs.product_id = dp.product_id
+WHERE dp.product_name = 'Latte';
+```
+
+**Theft analysis:**
+```sql
+SELECT
+  date_sent,
+  branch_id,
+  ingredient_id,
+  sent_qty,
+  confirmed_qty,
+  sent_qty - confirmed_qty as stolen,
+  ROUND((sent_qty - confirmed_qty) / sent_qty * 100, 1) as theft_pct
+FROM shipment
+WHERE status = 'confirmed'
+ORDER BY theft_pct DESC;
+```
+
 ## Roadmap
 
 - [x] Barcelona-centric branches
@@ -230,16 +306,17 @@ Alerts are aggregated per branch per day. Each `BRANCH_RESTOCK_NEEDED` alert lis
 - [x] Shipment tracking with theft simulation
 - [x] Trust but verify (confirmed_qty)
 - [x] Aggregated branch restock alerts (one per branch/day)
+- [x] Grafana integration (gold → PostgreSQL)
 - [ ] SNS alerts via LocalStack → AWS
 - [ ] Supplier restocking for warehouse
 - [ ] Driver performance tracking (theft rate per driver)
-- [ ] Grafana dashboard
 
 ## Stack
 
 - **Airflow 2.8** — orchestration
 - **Pandas + PyArrow** — transforms
-- **PostgreSQL** — Airflow metadata
+- **PostgreSQL** — Airflow metadata + gold tables
+- **Grafana** — dashboards
 - **LocalStack** — AWS emulation
 - **Docker Compose** — local deployment
 - **PyYAML** — config management
