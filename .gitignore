@@ -21,3 +21,4 @@ data/alerts/*.json
 .DS_Store
 Thumbs.db
 .claude
+grafana/
