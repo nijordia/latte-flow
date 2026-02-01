@@ -210,8 +210,9 @@ def process_inventory_and_shipments():
        b. Deduct today's sales from branch inventory
        c. Check branch stock levels
        d. If low → check warehouse → create shipment (2x min_reorder)
-       e. If warehouse empty → alert
-    3. Save all outputs
+       e. If warehouse empty → accumulate shortage
+    3. At end of each date, flush aggregated BRANCH_RESTOCK_NEEDED alerts
+    4. Save all outputs
     """
     recipes_cfg = load_config("recipes")["recipes"]
     inventory_cfg = load_config("inventory")
@@ -275,6 +276,9 @@ def process_inventory_and_shipments():
             date_str = pd.Timestamp(current_date).strftime("%Y-%m-%d")
             print(f"\n=== Processing {date_str} ===")
 
+            # Track which branch/ingredients need restocking: {branch_id: {ing_id: {"reasons": [...]}}}
+            branch_shortages = {}
+
             # 1. Confirm pending shipments from previous day (with theft)
             for pending in pending_shipments:
                 theft_rate = random.uniform(THEFT_MIN, THEFT_MAX)
@@ -319,20 +323,16 @@ def process_inventory_and_shipments():
                                   f"{product_id} but only had {old_stock:.1f} {warehouse[ing_id]['unit']} "
                                   f"of {ing_id} left. Stock capped at 0.")
 
-                            # Create oversold alert
-                            alerts.append({
-                                "timestamp": date_str,
-                                "type": "OVERSOLD_BRANCH",
-                                "severity": "warning",
-                                "branch_id": branch_id,
-                                "ingredient_id": ing_id,
-                                "ingredient_name": warehouse[ing_id]["name"],
-                                "unit": warehouse[ing_id]["unit"],
-                                "old_stock": round(old_stock, 2),
-                                "attempted_deduction": amount,
+                            # Flag this ingredient for restock alert
+                            if branch_id not in branch_shortages:
+                                branch_shortages[branch_id] = {}
+                            if ing_id not in branch_shortages[branch_id]:
+                                branch_shortages[branch_id][ing_id] = {"reasons": []}
+                            branch_shortages[branch_id][ing_id]["reasons"].append({
+                                "type": "OVERSOLD",
                                 "product_id": product_id,
-                                "qty_sold": qty,
-                                "date": date_str,
+                                "attempted_deduction": amount,
+                                "was_stock": round(old_stock, 2),
                             })
                         else:
                             branch_inventory[branch_id][ing_id]["current_stock"] = new_stock
@@ -371,21 +371,53 @@ def process_inventory_and_shipments():
                             print(f"  SHIPMENT SENT: {ing_id} to branch {branch_id}: "
                                   f"qty={request_qty:.0f} (branch had {current:.0f}, min={min_reorder:.0f})")
                         else:
-                            # Warehouse empty - alert!
-                            alert = {
-                                "timestamp": date_str,
-                                "type": "WAREHOUSE_EMPTY",
-                                "severity": "critical",
-                                "ingredient_id": ing_id,
-                                "ingredient_name": warehouse[ing_id]["name"],
-                                "warehouse_stock": warehouse[ing_id]["current_stock"],
-                                "requested_qty": request_qty,
-                                "branch_id": branch_id,
-                            }
-                            alerts.append(alert)
+                            # Warehouse empty - flag for aggregated alert
                             print(f"  ALERT: Warehouse empty for {ing_id}! "
                                   f"Branch {branch_id} needs {request_qty:.0f}, "
                                   f"warehouse has {warehouse[ing_id]['current_stock']:.0f}")
+
+                            if branch_id not in branch_shortages:
+                                branch_shortages[branch_id] = {}
+                            if ing_id not in branch_shortages[branch_id]:
+                                branch_shortages[branch_id][ing_id] = {"reasons": []}
+                            branch_shortages[branch_id][ing_id]["reasons"].append({
+                                "type": "WAREHOUSE_EMPTY",
+                                "requested_qty": request_qty,
+                                "warehouse_stock": warehouse[ing_id]["current_stock"],
+                            })
+
+            # 4. Flush aggregated BRANCH_RESTOCK_NEEDED alerts for this date
+            for branch_id, ingredients in branch_shortages.items():
+                # Determine severity: critical if any WAREHOUSE_EMPTY, else warning
+                has_critical = any(
+                    any(r["type"] == "WAREHOUSE_EMPTY" for r in ing_data["reasons"])
+                    for ing_data in ingredients.values()
+                )
+                severity = "critical" if has_critical else "warning"
+
+                items = []
+                for ing_id, ing_data in ingredients.items():
+                    # needed_qty is always 2x min_reorder (standard shipment amount)
+                    restock_qty = branch_defaults[ing_id]["min_reorder"] * 2
+                    items.append({
+                        "ingredient_id": ing_id,
+                        "ingredient_name": warehouse[ing_id]["name"],
+                        "unit": warehouse[ing_id]["unit"],
+                        "needed_qty": restock_qty,
+                        "warehouse_stock": warehouse[ing_id]["current_stock"],
+                        "reasons": ing_data["reasons"],
+                    })
+
+                alert = {
+                    "timestamp": date_str,
+                    "type": "BRANCH_RESTOCK_NEEDED",
+                    "branch_id": branch_id,
+                    "date": date_str,
+                    "severity": severity,
+                    "items": items,
+                }
+                alerts.append(alert)
+                print(f"  AGGREGATED ALERT: Branch {branch_id} -> {len(items)} item(s)")
 
         # Confirm any remaining pending shipments (simulate next day)
         final_date = pd.Timestamp(dates[-1]) + timedelta(days=1)
@@ -474,6 +506,12 @@ def process_inventory_and_shipments():
         with open(alert_file, "w") as f:
             json.dump({"alerts": alerts, "count": len(alerts)}, f, indent=2)
         print(f"Written: {alert_file} ({len(alerts)} alerts)")
+
+        # Print alert summary
+        print("\nAlert summary:")
+        for alert in alerts:
+            print(f"  BRANCH_RESTOCK_NEEDED: Branch {alert['branch_id']} on {alert['date']} "
+                  f"[{alert['severity']}] - {len(alert['items'])} ingredient(s)")
 
     return {
         "warehouse": str(warehouse_path),

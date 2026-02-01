@@ -61,7 +61,7 @@ Trigger the DAG, watch shipments flow.
                               ▼ sales deduct from branch
 ```
 
-**Oversold handling:** The pipeline treats POS sales data as historical truth. If a branch sells more units than available ingredients, stock is capped at 0 in `branch_inventory.parquet` and an `OVERSOLD_BRANCH` alert is generated. This reflects real-world retail behavior where baristas may serve the last item before noticing stock is depleted.
+**Oversold handling:** The pipeline treats POS sales data as historical truth. If a branch sells more units than available ingredients, stock is capped at 0 in `branch_inventory.parquet`. At the end of each day, one aggregated `BRANCH_RESTOCK_NEEDED` alert is generated per affected branch, summarizing all ingredients that need restocking. This reflects real-world retail behavior where baristas may serve the last item before noticing stock is depleted.
 
 ## Shipment flow
 
@@ -185,22 +185,43 @@ status              : pending | confirmed
 
 ## Alert output
 
+Alerts are aggregated per branch per day. Each `BRANCH_RESTOCK_NEEDED` alert lists all ingredients that branch needs restocked, with `needed_qty` set to the standard shipment amount (2x min_reorder).
+
 ```json
 {
   "alerts": [
     {
-      "type": "WAREHOUSE_EMPTY",
+      "timestamp": "2026-01-15",
+      "type": "BRANCH_RESTOCK_NEEDED",
+      "branch_id": 2,
+      "date": "2026-01-15",
       "severity": "critical",
-      "ingredient_id": "milk",
-      "ingredient_name": "Whole Milk",
-      "warehouse_stock": 0,
-      "requested_qty": 4000,
-      "branch_id": 3
+      "items": [
+        {
+          "ingredient_id": "milk",
+          "ingredient_name": "Whole Milk",
+          "unit": "ml",
+          "needed_qty": 4000,
+          "warehouse_stock": 0,
+          "reasons": [
+            {"type": "OVERSOLD", "product_id": 102, "attempted_deduction": 180, "was_stock": 50},
+            {"type": "WAREHOUSE_EMPTY", "requested_qty": 4000, "warehouse_stock": 0}
+          ]
+        }
+      ]
     }
   ],
   "count": 1
 }
 ```
+
+**Severity levels:**
+- `warning` — Branch had oversold events but shipments were fulfilled
+- `critical` — Warehouse couldn't fulfill a shipment request
+
+**Reason types:**
+- `OVERSOLD` — Branch sold more than available stock
+- `WAREHOUSE_EMPTY` — Warehouse couldn't fulfill the restock request
 
 ## Roadmap
 
@@ -208,6 +229,7 @@ status              : pending | confirmed
 - [x] Warehouse/branch inventory split
 - [x] Shipment tracking with theft simulation
 - [x] Trust but verify (confirmed_qty)
+- [x] Aggregated branch restock alerts (one per branch/day)
 - [ ] SNS alerts via LocalStack → AWS
 - [ ] Supplier restocking for warehouse
 - [ ] Driver performance tracking (theft rate per driver)
