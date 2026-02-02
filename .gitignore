@@ -15,9 +15,11 @@ build/
 *.log
 logs/
 data/bronze/*.csv
+data/bronze/archive/
 data/silver/*.parquet
 data/gold/*.parquet
 data/alerts/*.json
+data/state/
 .DS_Store
 Thumbs.db
 

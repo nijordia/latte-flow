@@ -25,7 +25,7 @@ Centralizes POS exports from 5 Barcelona coffee shops, tracks ingredient invento
 ## Quick start
 
 ```bash
-# generate fake data (30 days, 500 rows, 5 branches)
+# generate fake data (30 days, one CSV per day)
 python scripts/generate_fake.py
 
 # spin up airflow + postgres + localstack + grafana
@@ -37,6 +37,39 @@ open http://localhost:3000   # Grafana (admin / admin)
 ```
 
 Trigger the DAG, watch shipments flow. Gold tables load to PostgreSQL for Grafana.
+
+## Incremental processing
+
+The pipeline is **incremental** — it only processes new data and maintains persistent state.
+
+**Daily CSV files:**
+- Data generator outputs one file per day: `sales_2026-01-01.csv`, `sales_2026-01-02.csv`, etc.
+- Each file contains all branch sales for that day
+- Drop new CSVs in `data/bronze/` and trigger the DAG
+
+**Persistent stock:**
+- Branch and warehouse stock levels persist in PostgreSQL (`current_branch_stock`, `current_warehouse_stock`)
+- Stock carries forward between DAG runs — no re-computation from scratch
+- Processed dates tracked in `processed_dates` table
+
+**Archiving:**
+- After successful processing, CSVs move to `data/bronze/archive/YYYY-MM-DD/`
+- Keeps bronze folder clean, preserves history
+
+**State files:**
+- `data/state/processed_files.json` — tracks which CSVs have been ingested
+
+**To reset state** (start fresh):
+```bash
+# Delete state and archive
+rm -rf data/state/ data/bronze/archive/
+
+# Clear PostgreSQL state tables (run in psql or pgAdmin)
+DROP TABLE IF EXISTS current_branch_stock, current_warehouse_stock, processed_dates;
+
+# Re-run data generator
+python scripts/generate_fake.py
+```
 
 ## Inventory model
 
@@ -88,7 +121,7 @@ shipment_received_at: 2026-01-15
 alive
   │
   ▼
-bronze_to_parquet
+bronze_to_parquet (incremental: only new CSVs)
   │
   ▼
 silver_clean
@@ -99,11 +132,15 @@ gold_fact_sales
   ├────────────────────┬────────────────────┐
   ▼                    ▼                    ▼
 gold_dim_product    gold_dim_branch    process_inventory_and_shipments
-                                           │
+                                           │  (incremental: persistent stock)
                                      ┌─────┴─────┐
                                      ▼           ▼
                           check_warehouse    load_gold_to
                               _alerts          _postgres
+                                     │           │
+                                     └─────┬─────┘
+                                           ▼
+                                   archive_bronze_files
 ```
 
 ## Project structure
@@ -118,13 +155,14 @@ latte-flow/
 │   ├── branches.yaml           # 5 Barcelona locations + warehouse
 │   └── inventory.yaml          # warehouse + branch stock levels
 ├── scripts/
-│   └── generate_fake.py        # fake data generator
+│   └── generate_fake.py        # fake data generator (daily CSVs)
 ├── data/
-│   ├── bronze/                 # raw CSVs
-│   ├── silver/                 # parquet
+│   ├── bronze/                 # raw CSVs (sales_YYYY-MM-DD.csv)
+│   │   └── archive/            # processed CSVs (organized by date)
+│   ├── silver/                 # parquet (sales.parquet, sales_clean.parquet)
 │   ├── gold/                   # fact + dim tables + shipments
-│   └── alerts/                 # JSON alerts
-├── grafana/                    # Grafana data (auto-created)
+│   ├── alerts/                 # JSON alerts
+│   └── state/                  # incremental state (processed_files.json)
 ├── docker-compose.yml
 ├── requirements.txt
 └── .env
