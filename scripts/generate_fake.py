@@ -7,6 +7,7 @@ Chaos mode: extreme oversold on specific days (hundreds of lattes), still one CS
 
 1. Generate the initial 30-day baseline (one-time)
     python scripts/generate_fake.py --rows 800 --days 30
+    python scripts/generate_fake.py --chaos --days 30 --rows 800
 
 2. Simulate "one new day" (daily/ongoing mode) 
     python scripts/generate_fake.py --days 1 --start-date "2026-01-31" --rows 30
@@ -42,7 +43,7 @@ def generate_fake_data(
 ):
     """Generate fake POS sales, grouped by day for daily CSVs."""
     if start_date is None:
-        start_date = datetime(2026, 1, 1)
+        start_date = datetime(2026, 1, 31)
 
     products_cfg = load_config("products")["products"]
 
@@ -100,18 +101,19 @@ def generate_fake_data(
 
     # Inject oversold chaos days (only in chaos mode)
     if chaos_mode:
-        oversell_days = [3, 10, 17, 24]  # Jan 4, 11, 18, 25
+        oversell_days = [3, 10, 17, 24]  # relative offsets
         for day_offset in oversell_days:
-            date = start_date + timedelta(days=day_offset)
-            date_str = date.strftime("%Y-%m-%d")
-            for _ in range(80):  # ~1600 extra lattes per day
-                daily_rows[date_str].append({
-                    "date": date_str,
-                    "branch_id": random.choice(branch_ids),
-                    "product_id": 102,  # latte = milk killer
-                    "qty": 20,
-                    "total_paid": round(products_cfg[102]["base_price_eur"] * 20 * 0.95, 2),
-                })
+            if day_offset < num_days:  # ← only if offset is inside requested days
+                date = start_date + timedelta(days=day_offset)
+                date_str = date.strftime("%Y-%m-%d")
+                for _ in range(80):
+                    daily_rows[date_str].append({
+                        "date": date_str,
+                        "branch_id": random.choice(branch_ids),
+                        "product_id": 102,  # latte = milk killer
+                        "qty": 20,
+                        "total_paid": round(products_cfg[102]["base_price_eur"] * 20 * 0.95, 2),
+                    })
 
     return daily_rows
 
@@ -131,6 +133,7 @@ def main():
     parser.add_argument("--chaos", action="store_true", help="Generate extreme oversold scenario")
     parser.add_argument("--rows", type=int, default=500, help="Base number of sales rows (normal mode)")
     parser.add_argument("--days", type=int, default=30, help="Number of days span (normal mode)")
+    parser.add_argument("--start-date", type=str, default=None, help="Start date in YYYY-MM-DD format")
     args = parser.parse_args()
 
     branches_cfg = load_config("branches")["branches"]
@@ -151,9 +154,19 @@ def main():
         print("  - Tuesday croissant 30% off")
     print()
 
+    # Parse start_date if provided
+    start_dt = None
+    if args.start_date:
+        try:
+            start_dt = datetime.strptime(args.start_date, "%Y-%m-%d")
+        except ValueError:
+            print("Error: --start-date must be in YYYY-MM-DD format")
+            exit(1)
+
     daily_rows = generate_fake_data(
         num_rows=args.rows,
         num_days=args.days,
+        start_date=start_dt,
         chaos_mode=args.chaos,
     )
 

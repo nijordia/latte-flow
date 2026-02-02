@@ -65,7 +65,7 @@ The pipeline is **incremental** — it only processes new data and maintains per
 rm -rf data/state/ data/bronze/archive/
 
 # Clear PostgreSQL state tables (run in psql or pgAdmin)
-DROP TABLE IF EXISTS current_branch_stock, current_warehouse_stock, processed_dates;
+DROP TABLE IF EXISTS current_branch_stock, current_warehouse_stock, processed_dates, supplier_orders;
 
 # Re-run data generator
 python scripts/generate_fake.py
@@ -114,6 +114,40 @@ received_qty: 200    ← what should have arrived
 confirmed_qty: 186   ← what actually arrived (drivers steal)
 shipment_received_at: 2026-01-15
 ```
+
+## Supplier refill
+
+The warehouse automatically reorders from suppliers when stock runs low:
+
+1. **Check warehouse levels** at end of each day
+2. **If stock < min_reorder** → place supplier order
+3. **Order quantity**: `initial_stock × refill_multiplier` (default 2x)
+4. **Lead time**: 1 day (configurable)
+5. **No duplicate orders**: only one pending order per ingredient
+6. **No theft**: supplier deliveries are secure
+
+**Configuration** (in `configs/inventory.yaml`):
+```yaml
+supplier:
+  refill_multiplier: 2.0      # order 2x initial stock
+  lead_time_days: 1           # arrives next day
+  max_stock_multiplier: 5.0   # don't over-order
+```
+
+**State tracking** (PostgreSQL):
+```
+supplier_orders:
+  - order_id: 1
+  - ingredient_id: milk
+  - order_qty: 400000
+  - order_date: 2026-01-15
+  - expected_arrival: 2026-01-16
+  - status: pending / delivered
+```
+
+**Alert types**:
+- `SUPPLIER_ORDER_PLACED` — info alert when order is created
+- Separate from `BRANCH_RESTOCK_NEEDED` alerts (problem vs action)
 
 ## DAG structure
 
@@ -291,6 +325,7 @@ Gold tables are loaded to PostgreSQL after each DAG run. Connect Grafana to quer
 | `dim_warehouse` | Warehouse stock levels |
 | `branch_inventory` | Per-branch ingredient stock |
 | `shipment` | Shipments with theft tracking |
+| `supplier_orders` | Supplier orders with delivery status |
 
 ### Example queries
 
@@ -337,6 +372,36 @@ WHERE status = 'confirmed'
 ORDER BY theft_pct DESC;
 ```
 
+**Pending supplier orders:**
+```sql
+SELECT
+  ingredient_id,
+  order_qty,
+  order_date,
+  expected_arrival,
+  expected_arrival - CURRENT_DATE AS days_until_arrival
+FROM supplier_orders
+WHERE status = 'pending'
+ORDER BY expected_arrival;
+```
+
+**Warehouse stock health:**
+```sql
+SELECT
+  ingredient_id,
+  current_stock,
+  min_reorder,
+  initial_stock,
+  ROUND(current_stock / min_reorder * 100, 1) AS pct_of_min,
+  CASE
+    WHEN current_stock < min_reorder THEN 'LOW'
+    WHEN current_stock < min_reorder * 2 THEN 'OK'
+    ELSE 'GOOD'
+  END AS status
+FROM dim_warehouse
+ORDER BY pct_of_min ASC;
+```
+
 ## Roadmap
 
 - [x] Barcelona-centric branches
@@ -346,7 +411,7 @@ ORDER BY theft_pct DESC;
 - [x] Aggregated branch restock alerts (one per branch/day)
 - [x] Grafana integration (gold → PostgreSQL)
 - [ ] SNS alerts via LocalStack → AWS
-- [ ] Supplier restocking for warehouse
+- [x] Supplier restocking for warehouse
 - [ ] Driver performance tracking (theft rate per driver)
 
 ## Stack

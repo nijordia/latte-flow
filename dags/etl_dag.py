@@ -243,6 +243,142 @@ def mark_dates_processed(engine, dates: list):
         print(f"Marked {len(new_dates)} date(s) as processed")
 
 
+# =============================================================================
+# Supplier Order Management (Warehouse Refill)
+# =============================================================================
+
+def init_supplier_orders_table(engine):
+    """Create supplier_orders table if it doesn't exist."""
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS supplier_orders (
+                order_id SERIAL PRIMARY KEY,
+                ingredient_id TEXT NOT NULL,
+                order_qty NUMERIC NOT NULL,
+                order_date DATE NOT NULL,
+                expected_arrival DATE NOT NULL,
+                status TEXT DEFAULT 'pending',
+                delivered_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        # Partial unique index: only one pending order per ingredient
+        # This prevents duplicate pending orders even with race conditions
+        conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_supplier_order
+            ON supplier_orders (ingredient_id) WHERE status = 'pending'
+        """))
+    print("Supplier orders table initialized")
+
+
+def receive_supplier_deliveries(engine, current_date_str, warehouse):
+    """
+    Receive any pending supplier orders that have arrived.
+    Returns list of deliveries received.
+    """
+    with engine.begin() as conn:
+        # Find and mark delivered in one atomic operation
+        result = conn.execute(text("""
+            UPDATE supplier_orders
+            SET status = 'delivered', delivered_at = NOW()
+            WHERE status = 'pending' AND expected_arrival <= :current_date
+            RETURNING ingredient_id, order_qty
+        """), {"current_date": current_date_str})
+
+        deliveries = []
+        for row in result:
+            ing_id = row.ingredient_id
+            qty = float(row.order_qty)
+
+            # Add to warehouse stock (no theft on supplier deliveries - secure chain)
+            if ing_id in warehouse:
+                old_stock = warehouse[ing_id]["current_stock"]
+                warehouse[ing_id]["current_stock"] += qty
+                deliveries.append({
+                    "ingredient_id": ing_id,
+                    "qty": qty,
+                    "old_stock": old_stock,
+                    "new_stock": warehouse[ing_id]["current_stock"],
+                })
+                print(f"  SUPPLIER DELIVERY RECEIVED: {ing_id} +{qty:.0f} "
+                      f"(stock: {old_stock:.0f} -> {warehouse[ing_id]['current_stock']:.0f})")
+
+        return deliveries
+
+
+def place_supplier_order_if_needed(engine, ingredient_id, order_qty, order_date_str,
+                                    lead_time_days=1, current_stock=0, initial_stock=0,
+                                    max_stock_multiplier=5.0):
+    """
+    Place a supplier order if:
+    - No pending order exists for this ingredient
+    - Current stock is not already above max threshold
+
+    Returns dict with order details if placed, None if skipped.
+    """
+    # Skip if already well-stocked (prevent over-ordering)
+    max_stock = initial_stock * max_stock_multiplier
+    if current_stock > max_stock:
+        print(f"  SUPPLIER ORDER SKIPPED: {ingredient_id} (stock {current_stock:.0f} > max {max_stock:.0f})")
+        return None
+
+    expected_arrival = (
+        datetime.strptime(order_date_str, "%Y-%m-%d") + timedelta(days=lead_time_days)
+    ).strftime("%Y-%m-%d")
+
+    with engine.begin() as conn:
+        # Check if pending order exists
+        result = conn.execute(text("""
+            SELECT 1 FROM supplier_orders
+            WHERE ingredient_id = :ing_id AND status = 'pending'
+        """), {"ing_id": ingredient_id})
+
+        if result.fetchone():
+            print(f"  SUPPLIER ORDER SKIPPED: {ingredient_id} (pending order already exists)")
+            return None
+
+        # Place new order
+        conn.execute(text("""
+            INSERT INTO supplier_orders
+                (ingredient_id, order_qty, order_date, expected_arrival, status)
+            VALUES (:ing_id, :qty, :order_date, :arrival, 'pending')
+        """), {
+            "ing_id": ingredient_id,
+            "qty": order_qty,
+            "order_date": order_date_str,
+            "arrival": expected_arrival,
+        })
+        print(f"  SUPPLIER ORDER PLACED: {ingredient_id} +{order_qty:.0f}, arrives {expected_arrival}")
+
+        return {
+            "ingredient_id": ingredient_id,
+            "order_qty": order_qty,
+            "order_date": order_date_str,
+            "expected_arrival": expected_arrival,
+        }
+
+
+def get_pending_supplier_orders(engine):
+    """Get all pending supplier orders (for logging/parquet output)."""
+    with engine.connect() as conn:
+        result = conn.execute(text("""
+            SELECT ingredient_id, order_qty, order_date, expected_arrival, created_at
+            FROM supplier_orders
+            WHERE status = 'pending'
+            ORDER BY expected_arrival
+        """))
+        return [
+            {
+                "ingredient_id": row.ingredient_id,
+                "order_qty": float(row.order_qty),
+                "order_date": str(row.order_date),
+                "expected_arrival": str(row.expected_arrival),
+                "created_at": str(row.created_at),
+            }
+            for row in result
+        ]
+
+
 default_args = {
     "owner": "latte-flow",
     "depends_on_past": False,
@@ -508,6 +644,16 @@ def process_inventory_and_shipments():
         engine = get_postgres_engine()
         print("  PostgreSQL engine created")
 
+        # Initialize supplier orders table
+        init_supplier_orders_table(engine)
+
+        # Load supplier config (with defaults)
+        supplier_cfg = inventory_cfg.get("supplier", {})
+        refill_multiplier = supplier_cfg.get("refill_multiplier", 2.0)
+        lead_time_days = supplier_cfg.get("lead_time_days", 1)
+        max_stock_multiplier = supplier_cfg.get("max_stock_multiplier", 5.0)
+        print(f"  Supplier config: refill={refill_multiplier}x, lead_time={lead_time_days}d, max_stock={max_stock_multiplier}x")
+
         # Load persistent branch stock from DB (or initialize)
         branch_stock_db = load_branch_stock_from_db(engine, branch_ids, ingredient_ids, branch_defaults)
 
@@ -573,6 +719,8 @@ def process_inventory_and_shipments():
         new_shipments = []
         alerts = []
         new_dates_processed = []
+        supplier_orders_placed = []
+        supplier_deliveries_received = []
 
         if not sales_df.empty:
             # Get unique dates sorted, filter out already-processed
@@ -597,6 +745,12 @@ def process_inventory_and_shipments():
 
                     # Track which branch/ingredients need restocking
                     branch_shortages = {}
+
+                    # 0. Receive pending supplier deliveries (arrives today)
+                    deliveries = receive_supplier_deliveries(engine, date_str, warehouse)
+                    if deliveries:
+                        supplier_deliveries_received.extend(deliveries)
+                        print(f"  Received {len(deliveries)} supplier delivery(ies)")
 
                     # 1. Confirm pending shipments from previous day (with theft)
                     for pending in pending_shipments:
@@ -666,6 +820,11 @@ def process_inventory_and_shipments():
                                     shipment_id += 1
                                     warehouse[ing_id]["current_stock"] -= request_qty
 
+                                    # Safety guard: ensure warehouse stock never goes negative
+                                    if warehouse[ing_id]["current_stock"] < 0:
+                                        print(f"  WARNING: Warehouse {ing_id} went negative ({warehouse[ing_id]['current_stock']:.0f}), capping at 0")
+                                        warehouse[ing_id]["current_stock"] = 0
+
                                     shipment = {
                                         "shipment_id": shipment_id,
                                         "date_sent": date_str,
@@ -727,6 +886,36 @@ def process_inventory_and_shipments():
                         }
                         alerts.append(alert)
                         print(f"  AGGREGATED ALERT: Branch {branch_id} -> {len(items)} item(s)")
+
+                    # 5. Check warehouse levels and place supplier orders if needed
+                    for ing_id in ingredient_ids:
+                        if warehouse[ing_id]["current_stock"] < warehouse[ing_id]["min_reorder"]:
+                            order_qty = warehouse[ing_id]["initial_stock"] * refill_multiplier
+                            order_result = place_supplier_order_if_needed(
+                                engine=engine,
+                                ingredient_id=ing_id,
+                                order_qty=order_qty,
+                                order_date_str=date_str,
+                                lead_time_days=lead_time_days,
+                                current_stock=warehouse[ing_id]["current_stock"],
+                                initial_stock=warehouse[ing_id]["initial_stock"],
+                                max_stock_multiplier=max_stock_multiplier,
+                            )
+                            if order_result:
+                                supplier_orders_placed.append(order_result)
+                                # Add SUPPLIER_ORDER_PLACED alert for visibility
+                                alerts.append({
+                                    "timestamp": date_str,
+                                    "type": "SUPPLIER_ORDER_PLACED",
+                                    "date": date_str,
+                                    "severity": "info",
+                                    "ingredient_id": ing_id,
+                                    "ingredient_name": warehouse[ing_id]["name"],
+                                    "order_qty": order_qty,
+                                    "expected_arrival": order_result["expected_arrival"],
+                                    "current_stock": warehouse[ing_id]["current_stock"],
+                                    "min_reorder": warehouse[ing_id]["min_reorder"],
+                                })
 
                 # Confirm any remaining pending shipments (simulate next day)
                 if dates_to_process:
@@ -830,8 +1019,28 @@ def process_inventory_and_shipments():
 
             print("\nAlert summary:")
             for alert in alerts:
-                print(f"  BRANCH_RESTOCK_NEEDED: Branch {alert['branch_id']} on {alert['date']} "
-                      f"[{alert['severity']}] - {len(alert['items'])} ingredient(s)")
+                if alert["type"] == "BRANCH_RESTOCK_NEEDED":
+                    print(f"  BRANCH_RESTOCK_NEEDED: Branch {alert['branch_id']} on {alert['date']} "
+                          f"[{alert['severity']}] - {len(alert['items'])} ingredient(s)")
+                elif alert["type"] == "SUPPLIER_ORDER_PLACED":
+                    print(f"  SUPPLIER_ORDER_PLACED: {alert['ingredient_name']} +{alert['order_qty']:.0f} "
+                          f"on {alert['date']}, arrives {alert['expected_arrival']}")
+
+        # Print supplier summary
+        if supplier_orders_placed:
+            print(f"\nSupplier orders placed: {len(supplier_orders_placed)}")
+            for order in supplier_orders_placed:
+                print(f"  {order['ingredient_id']}: +{order['order_qty']:.0f}, arrives {order['expected_arrival']}")
+        if supplier_deliveries_received:
+            total_received = sum(d["qty"] for d in supplier_deliveries_received)
+            print(f"Supplier deliveries received: {len(supplier_deliveries_received)} ({total_received:.0f} units total)")
+
+        # Show pending supplier orders
+        pending_orders = get_pending_supplier_orders(engine)
+        if pending_orders:
+            print(f"\nPending supplier orders: {len(pending_orders)}")
+            for order in pending_orders:
+                print(f"  {order['ingredient_id']}: +{order['order_qty']:.0f}, arrives {order['expected_arrival']}")
 
         engine.dispose()
 
@@ -846,6 +1055,8 @@ def process_inventory_and_shipments():
             "total_shipments": len(all_shipments),
             "alerts": len(alerts),
             "dates_processed": len(new_dates_processed),
+            "supplier_orders_placed": len(supplier_orders_placed),
+            "supplier_deliveries_received": len(supplier_deliveries_received),
         }
 
     except Exception as e:

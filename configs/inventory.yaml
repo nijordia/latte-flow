@@ -60,3 +60,9 @@ branch_defaults:
   muffin_units:
     initial_stock: 40      # 40 per branch
     min_reorder: 5
+
+# Supplier refill settings (auto-replenish warehouse when low)
+supplier:
+  refill_multiplier: 2.0      # order this × initial_stock when low
+  lead_time_days: 1           # arrives next day
+  max_stock_multiplier: 5.0   # don't refill if stock > initial × this
